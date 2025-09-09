@@ -1,0 +1,606 @@
+import { WebSocketServer, WebSocket } from 'ws';
+import { createServer } from 'http';
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+
+interface Operation {
+  type: 'insert' | 'delete' | 'retain';
+  position: number;
+  content?: string;
+  length?: number;
+  clientId: string;
+  timestamp: number;
+  vectorClock: VectorClock;
+}
+
+interface VectorClock {
+  [clientId: string]: number;
+}
+
+interface ClientState {
+  id: string;
+  socket: WebSocket;
+  document: YDoc;
+  vectorClock: VectorClock;
+  lastSeen: number;
+}
+
+class OperationalTransform {
+  static transform(op1: Operation, op2: Operation, priority: boolean): Operation[] {
+    if (op1.type === 'retain' && op2.type === 'retain') return [op1];
+    
+    if (op1.type === 'insert' && op2.type === 'insert') {
+      if (op1.position <= op2.position) {
+        if (priority) return [op1];
+        return [{
+          ...op2,
+          position: op2.position + (op1.content?.length || 0)
+        }];
+      } else {
+        return [{
+          ...op1,
+          position: op1.position + (op2.content?.length || 0)
+        }];
+      }
+    }
+
+    if (op1.type === 'insert' && op2.type === 'delete') {
+      if (op1.position <= op2.position) {
+        return [op1, {
+          ...op2,
+          position: op2.position + (op1.content?.length || 0)
+        }];
+      } else if (op1.position > op2.position + (op2.length || 0)) {
+        return [{
+          ...op1,
+          position: op1.position - (op2.length || 0)
+        }];
+      } else {
+        const splitPos = op1.position - op2.position;
+        return [
+          { ...op1, position: op2.position },
+          { ...op2, length: splitPos },
+          { ...op2, position: op1.position + (op1.content?.length || 0), length: (op2.length || 0) - splitPos }
+        ];
+      }
+    }
+
+    if (op1.type === 'delete' && op2.type === 'insert') {
+      if (op2.position <= op1.position) {
+        return [{
+          ...op1,
+          position: op1.position + (op2.content?.length || 0)
+        }];
+      } else if (op2.position >= op1.position + (op1.length || 0)) {
+        return [op1];
+      } else {
+        const splitPos = op2.position - op1.position;
+        return [
+          { ...op1, length: splitPos },
+          { ...op1, position: op2.position + (op2.content?.length || 0), length: (op1.length || 0) - splitPos }
+        ];
+      }
+    }
+
+    if (op1.type === 'delete' && op2.type === 'delete') {
+      if (op1.position + (op1.length || 0) <= op2.position) return [op1];
+      if (op2.position + (op2.length || 0) <= op1.position) {
+        return [{
+          ...op1,
+          position: op1.position - (op2.length || 0)
+        }];
+      }
+      
+      const start = Math.min(op1.position, op2.position);
+      const end = Math.max(op1.position + (op1.length || 0), op2.position + (op2.length || 0));
+      return [{
+        type: 'delete',
+        position: start,
+        length: end - start,
+        clientId: op1.clientId,
+        timestamp: Math.max(op1.timestamp, op2.timestamp),
+        vectorClock: this.mergeVectorClocks(op1.vectorClock, op2.vectorClock)
+      }];
+    }
+
+    return [op1];
+  }
+
+  static mergeVectorClocks(vc1: VectorClock, vc2: VectorClock): VectorClock {
+    const merged: VectorClock = { ...vc1 };
+    for (const [clientId, clock] of Object.entries(vc2)) {
+      merged[clientId] = Math.max(merged[clientId] || 0, clock);
+    }
+    return merged;
+  }
+
+  static compareVectorClocks(vc1: VectorClock, vc2: VectorClock): 'before' | 'after' | 'concurrent' {
+    let hasLess = false;
+    let hasGreater = false;
+    
+    const allClients = new Set([...Object.keys(vc1), ...Object.keys(vc2)]);
+    
+    for (const clientId of allClients) {
+      const clock1 = vc1[clientId] || 0;
+      const clock2 = vc2[clientId] || 0;
+      
+      if (clock1 < clock2) hasLess = true;
+      if (clock1 > clock2) hasGreater = true;
+    }
+    
+    if (hasLess && !hasGreater) return 'before';
+    if (hasGreater && !hasLess) return 'after';
+    return 'concurrent';
+  }
+}
+
+class ConflictResolver {
+  private pendingOps: Map<string, Operation[]> = new Map();
+
+  resolveConflict(localOp: Operation, remoteOps: Operation[]): Operation[] {
+    let transformedOps = [localOp];
+    
+    remoteOps.sort((a, b) => {
+      const comparison = OperationalTransform.compareVectorClocks(a.vectorClock, b.vectorClock);
+      if (comparison === 'before') return -1;
+      if (comparison === 'after') return 1;
+      return a.timestamp - b.timestamp;
+    });
+
+    for (const remoteOp of remoteOps) {
+      const newTransformed: Operation[] = [];
+      for (const transformedOp of transformedOps) {
+        const priority = this.determinePriority(transformedOp, remoteOp);
+        const result = OperationalTransform.transform(transformedOp, remoteOp, priority);
+        newTransformed.push(...result);
+      }
+      transformedOps = newTransformed;
+    }
+
+    return transformedOps;
+  }
+
+  private determinePriority(op1: Operation, op2: Operation): boolean {
+    if (op1.timestamp !== op2.timestamp) {
+      return op1.timestamp < op2.timestamp;
+    }
+    return op1.clientId < op2.clientId;
+  }
+}
+
+class DocumentState {
+  private content: string = '';
+  private operations: Operation[] = [];
+  private clients: Map<string, VectorClock> = new Map();
+
+  applyOperation(op: Operation): boolean {
+    if (!this.validateOperation(op)) return false;
+    
+    this.updateVectorClock(op.clientId, op.vectorClock);
+    
+    switch (op.type) {
+      case 'insert':
+        this.content = this.content.slice(0, op.position) + 
+                      (op.content || '') + 
+                      this.content.slice(op.position);
+        break;
+      case 'delete':
+        this.content = this.content.slice(0, op.position) + 
+                      this.content.slice(op.position + (op.length || 0));
+        break;
+    }
+    
+    this.operations.push(op);
+    return true;
+  }
+
+  private validateOperation(op: Operation): boolean {
+    if (op.position < 0 || op.position > this.content.length) return false;
+    if (op.type === 'delete' && (op.position + (op.length || 0)) > this.content.length) return false;
+    return true;
+  }
+
+  private updateVectorClock(clientId: string, vectorClock: VectorClock): void {
+    if (!this.clients.has(clientId)) {
+      this.clients.set(clientId, {});
+    }
+    
+    const clientClock = this.clients.get(clientId)!;
+    for (const [id, clock] of Object.entries(vectorClock)) {
+      clientClock[id] = Math.max(clientClock[id] || 0, clock);
+    }
+  }
+
+  getState(): { content: string; vectorClock: VectorClock } {
+    const mergedClock: VectorClock = {};
+    for (const clock of this.clients.values()) {
+      for (const [clientId, value] of Object.entries(clock)) {
+        mergedClock[clientId] = Math.max(mergedClock[clientId] || 0, value);
+      }
+    }
+    
+    return {
+      content: this.content,
+      vectorClock: mergedClock
+    };
+  }
+}
+
+class CollaborativeServer {
+  private wss: WebSocketServer;
+  private clients: Map<string, ClientState> = new Map();
+  private document: DocumentState = new DocumentState();
+  private resolver: ConflictResolver = new ConflictResolver();
+  private yDoc: Y.Doc = new Y.Doc();
+  private yText: Y.Text;
+
+  constructor(port: number) {
+    const app = express();
+    const server = createServer(app);
+    
+    this.wss = new WebSocketServer({ server });
+    this.yText = this.yDoc.getText('content');
+    
+    this.setupYjsSync();
+    this.setupWebSocketHandlers();
+    
+    server.listen(port, () => {
+      console.log(`Collaborative server running on port ${port}`);
+    });
+  }
+
+  private setupYjsSync(): void {
+    this.yText.observe((event) => {
+      const ops = this.convertYjsToOps(event);
+      this.broadcastOperations(ops);
+    });
+  }
+
+  private convertYjsToOps(event: Y.YTextEvent): Operation[] {
+    const ops: Operation[] = [];
+    let index = 0;
+    
+    event.changes.delta.forEach((change: any) => {
+      if (change.retain) {
+        index += change.retain;
+      } else if (change.insert) {
+        ops.push({
+          type: 'insert',
+          position: index,
+          content: change.insert,
+          clientId: 'yjs-sync',
+          timestamp: Date.now(),
+          vectorClock: {}
+        });
+        index += change.insert.length;
+      } else if (change.delete) {
+        ops.push({
+          type: 'delete',
+          position: index,
+          length: change.delete,
+          clientId: 'yjs-sync',
+          timestamp: Date.now(),
+          vectorClock: {}
+        });
+      }
+    });
+    
+    return ops;
+  }
+
+  private setupWebSocketHandlers(): void {
+    this.wss.on('connection', (socket: WebSocket) => {
+      const clientId = uuidv4();
+      const clientState: ClientState = {
+        id: clientId,
+        socket,
+        document: new Y.Doc(),
+        vectorClock: { [clientId]: 0 },
+        lastSeen: Date.now()
+      };
+      
+      this.clients.set(clientId, clientState);
+      
+      socket.send(JSON.stringify({
+        type: 'init',
+        clientId,
+        state: this.document.getState()
+      }));
+
+      socket.on('message', (data) => {
+        this.handleMessage(clientId, JSON.parse(data.toString()));
+      });
+
+      socket.on('close', () => {
+        this.clients.delete(clientId);
+        this.broadcastClientDisconnect(clientId);
+      });
+
+      socket.on('error', (error) => {
+        console.error(`Client ${clientId} error:`, error);
+        this.clients.delete(clientId);
+      });
+    });
+  }
+
+  private handleMessage(clientId: string, message: any): void {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    client.lastSeen = Date.now();
+
+    switch (message.type) {
+      case 'operation':
+        this.handleOperation(clientId, message.operation);
+        break;
+      case 'cursor':
+        this.handleCursor(clientId, message.position);
+        break;
+      case 'selection':
+        this.handleSelection(clientId, message.start, message.end);
+        break;
+      case 'heartbeat':
+        client.socket.send(JSON.stringify({ type: 'heartbeat' }));
+        break;
+    }
+  }
+
+  private handleOperation(clientId: string, operation: Operation): void {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    client.vectorClock[clientId] = (client.vectorClock[clientId] || 0) + 1;
+    operation.vectorClock = { ...client.vectorClock };
+    operation.clientId = clientId;
+    operation.timestamp = Date.now();
+
+    const conflicts = this.detectConflicts(operation);
+    const resolvedOps = conflicts.length > 0 
+      ? this.resolver.resolveConflict(operation, conflicts)
+      : [operation];
+
+    resolvedOps.forEach(op => {
+      if (this.document.applyOperation(op)) {
+        this.syncWithYjs(op);
+        this.broadcastOperation(op, clientId);
+      }
+    });
+  }
+
+  private detectConflicts(operation: Operation): Operation[] {
+    return [];
+  }
+
+  private syncWithYjs(operation: Operation): void {
+    this.yDoc.transact(() => {
+      switch (operation.type) {
+        case 'insert':
+          this.yText.insert(operation.position, operation.content || '');
+          break;
+        case 'delete':
+          this.yText.delete(operation.position, operation.length || 0);
+          break;
+      }
+    });
+  }
+
+  private broadcastOperation(operation: Operation, excludeClient?: string): void {
+    const message = JSON.stringify({
+      type: 'operation',
+      operation
+    });
+
+    this.clients.forEach((client, clientId) => {
+      if (clientId !== excludeClient && client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(message);
+      }
+    });
+  }
+
+  private broadcastOperations(operations: Operation[]): void {
+    operations.forEach(op => this.broadcastOperation(op));
+  }
+
+  private handleCursor(clientId: string, position: number): void {
+    const message = JSON.stringify({
+      type: 'cursor',
+      clientId,
+      position
+    });
+
+    this.clients.forEach((client, id) => {
+      if (id !== clientId && client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(message);
+      }
+    });
+  }
+
+  private handleSelection(clientId: string, start: number, end: number): void {
+    const message = JSON.stringify({
+      type: 'selection',
+      clientId,
+      start,
+      end
+    });
+
+    this.clients.forEach((client, id) => {
+      if (id !== clientId && client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(message);
+      }
+    });
+  }
+
+  private broadcastClientDisconnect(clientId: string): void {
+    const message = JSON.stringify({
+      type: 'client-disconnect',
+      clientId
+    });
+
+    this.clients.forEach((client) => {
+      if (client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(message);
+      }
+    });
+  }
+}
+
+class CollaborativeClient {
+  private socket: WebSocket;
+  private clientId: string = '';
+  private vectorClock: VectorClock = {};
+  private document: string = '';
+  private pendingOps: Operation[] = [];
+  private onDocumentChange?: (content: string) => void;
+  private onCursorChange?: (clientId: string, position: number) => void;
+
+  constructor(serverUrl: string) {
+    this.socket = new WebSocket(serverUrl);
+    this.setupSocketHandlers();
+  }
+
+  private setupSocketHandlers(): void {
+    this.socket.onopen = () => {
+      console.log('Connected to collaborative server');
+    };
+
+    this.socket.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      this.handleMessage(message);
+    };
+
+    this.socket.onclose = () => {
+      console.log('Disconnected from server');
+      setTimeout(() => this.reconnect(), 1000);
+    };
+
+    this.socket.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+  }
+
+  private handleMessage(message: any): void {
+    switch (message.type) {
+      case 'init':
+        this.clientId = message.clientId;
+        this.document = message.state.content;
+        this.vectorClock = message.state.vectorClock;
+        if (this.onDocumentChange) {
+          this.onDocumentChange(this.document);
+        }
+        break;
+
+      case 'operation':
+        this.applyRemoteOperation(message.operation);
+        break;
+
+      case 'cursor':
+        if (this.onCursorChange) {
+          this.onCursorChange(message.clientId, message.position);
+        }
+        break;
+    }
+  }
+
+  private applyRemoteOperation(operation: Operation): void {
+    this.vectorClock = OperationalTransform.mergeVectorClocks(
+      this.vectorClock, 
+      operation.vectorClock
+    );
+
+    const transformedPending: Operation[] = [];
+    for (const pendingOp of this.pendingOps) {
+      const transformed = OperationalTransform.transform(
+        pendingOp, 
+        operation, 
+        pendingOp.clientId < operation.clientId
+      );
+      transformedPending.push(...transformed);
+    }
+    this.pendingOps = transformedPending;
+
+    this.applyOperationToDocument(operation);
+  }
+
+  private applyOperationToDocument(operation: Operation): void {
+    switch (operation.type) {
+      case 'insert':
+        this.document = this.document.slice(0, operation.position) + 
+                       (operation.content || '') + 
+                       this.document.slice(operation.position);
+        break;
+      case 'delete':
+        this.document = this.document.slice(0, operation.position) + 
+                       this.document.slice(operation.position + (operation.length || 0));
+        break;
+    }
+
+    if (this.onDocumentChange) {
+      this.onDocumentChange(this.document);
+    }
+  }
+
+  insert(position: number, content: string): void {
+    const operation: Operation = {
+      type: 'insert',
+      position,
+      content,
+      clientId: this.clientId,
+      timestamp: Date.now(),
+      vectorClock: { ...this.vectorClock, [this.clientId]: (this.vectorClock[this.clientId] || 0) + 1 }
+    };
+
+    this.pendingOps.push(operation);
+    this.applyOperationToDocument(operation);
+    this.send({ type: 'operation', operation });
+  }
+
+  delete(position: number, length: number): void {
+    const operation: Operation = {
+      type: 'delete',
+      position,
+      length,
+      clientId: this.clientId,
+      timestamp: Date.now(),
+      vectorClock: { ...this.vectorClock, [this.clientId]: (this.vectorClock[this.clientId] || 0) + 1 }
+    };
+
+    this.pendingOps.push(operation);
+    this.applyOperationToDocument(operation);
+    this.send({ type: 'operation', operation });
+  }
+
+  setCursor(position: number): void {
+    this.send({ type: 'cursor', position });
+  }
+
+  setSelection(start: number, end: number): void {
+    this.send({ type: 'selection', start, end });
+  }
+
+  onDocumentChanged(callback: (content: string) => void): void {
+    this.onDocumentChange = callback;
+  }
+
+  onCursorChanged(callback: (clientId: string, position: number) => void): void {
+    this.onCursorChange = callback;
+  }
+
+  private send(message: any): void {
+    if (this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(message));
+    }
+  }
+
+  private reconnect(): void {
+    if (this.socket.readyState === WebSocket.CLOSED) {
+      this.socket = new WebSocket(this.socket.url);
+      this.setupSocketHandlers();
+    }
+  }
+}
+
+const server = new CollaborativeServer(3000);
+
+export { CollaborativeServer, CollaborativeClient, OperationalTransform, ConflictResolver };
