@@ -2,7 +2,7 @@
 
 A high-performance, distributed collaborative text editor built with TypeScript, featuring operational transforms, conflict resolution, and real-time synchronization.
 
-##  Features
+## 🚀 Features
 
 ### Core Architecture
 - **Operational Transform Algorithm** - Conflict-free collaborative editing
@@ -25,7 +25,7 @@ A high-performance, distributed collaborative text editor built with TypeScript,
 - **Performance Monitoring** - Built-in metrics and health checks
 - **Horizontal Scaling** - Redis-based session clustering
 
-##  Architecture
+## 🏗️ Architecture
 
 ```
 ┌─────────────────┐    WebSocket    ┌──────────────────┐
@@ -64,7 +64,7 @@ A high-performance, distributed collaborative text editor built with TypeScript,
 - **Containerization**: Docker with multi-stage builds
 - **Type Safety**: Strict TypeScript configuration
 
-##  Quick Start
+## 🚦 Quick Start
 
 ### Prerequisites
 - Node.js 18+
@@ -143,7 +143,7 @@ npm run benchmark
 - WebSocket message handling
 - Document state management
 
-##  Performance Characteristics
+## 📊 Performance Characteristics
 
 ### Benchmarks
 - **Operation Throughput**: 50,000+ ops/sec per server
@@ -159,7 +159,7 @@ npm run benchmark
 - WebSocket message compression
 - Client-side operation batching
 
-##  Security Considerations
+## 🔒 Security Considerations
 
 - Input validation and sanitization
 - Rate limiting per client connection
@@ -167,7 +167,7 @@ npm run benchmark
 - Document access control (extendable)
 - Operation replay attack prevention
 
-##  Production Deployment
+## 🚀 Production Deployment
 
 ### Kubernetes Configuration
 
