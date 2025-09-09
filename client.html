@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Collaborative Editor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #ffffff;
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+        }
+
+        .title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .editor-container {
+            position: relative;
+            height: calc(100vh - 64px);
+            display: flex;
+        }
+
+        .editor {
+            flex: 1;
+            background: #1a1a1a;
+            border: none;
+            outline: none;
+            padding: 20px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #ffffff;
+            resize: none;
+            overflow-y: auto;
+        }
+
+        .editor::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .editor::-webkit-scrollbar-track {
+            background: #2a2a2a;
+        }
+
+        .editor::-webkit-scrollbar-thumb {
+            background: #4a4a4a;
+            border-radius: 3px;
+        }
+
+        .cursors {
+            position: absolute;
+            pointer-events: none;
+            top: 20px;
+            left: 20px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .cursor {
+            position: absolute;
+            width: 2px;
+            height: 22px;
+            background: #3b82f6;
+            animation: blink 1s infinite;
+            z-index: 10;
+        }
+
+        .cursor.client-1 { background: #ef4444; }
+        .cursor.client-2 { background: #10b981; }
+        .cursor.client-3 { background: #f59e0b; }
+        .cursor.client-4 { background: #8b5cf6; }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        .cursor-label {
+            position: absolute;
+            top: -24px;
+            left: 0;
+            background: inherit;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: nowrap;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .selection {
+            position: absolute;
+            background: rgba(59, 130, 246, 0.2);
+            pointer-events: none;
+        }
+
+        .sidebar {
+            width: 250px;
+            background: #111111;
+            border-left: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .clients-list {
+            padding: 16px;
+            border-bottom: 1px solid #333;
+        }
+
+        .clients-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        .client-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0;
+        }
+
+        .client-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .client-name {
+            font-size: 13px;
+            color: #ccc;
+        }
+
+        .operations-log {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+        }
+
+        .operations-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        .operation-item {
+            padding: 8px;
+            margin: 4px 0;
+            background: #1a1a1a;
+            border-radius: 6px;
+            font-size: 11px;
+            color: #ccc;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+
+        .operation-type {
+            color: #3b82f6;
+            font-weight: 600;
+        }
+
+        .operation-insert { border-left: 3px solid #10b981; }
+        .operation-delete { border-left: 3px solid #ef4444; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">Collaborative Editor</div>
+        <div class="status">
+            <div class="status-dot"></div>
+            <span id="connection-status">Connected</span>
+        </div>
+    </div>
+
+    <div class="editor-container">
+        <div style="flex: 1; position: relative;">
+            <textarea id="editor" class="editor" placeholder="Start typing to begin collaborative editing..."></textarea>
+            <div id="cursors" class="cursors"></div>
+        </div>
+
+        <div class="sidebar">
+            <div class="clients-list">
+                <div class="clients-title">Active Users</div>
+                <div id="clients-container"></div>
+            </div>
+
+            <div class="operations-log">
+                <div class="operations-title">Operations Log</div>
+                <div id="operations-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class CollaborativeEditor {
+            constructor() {
+                this.socket = null;
+                this.clientId = '';
+                this.clients = new Map();
+                this.editor = document.getElementById('editor');
+                this.cursors = document.getElementById('cursors');
+                this.lastContent = '';
+                this.operationHistory = [];
+                
+                this.setupEditor();
+                this.connect();
+            }
+
+            connect() {
+                const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                this.socket = new WebSocket(`${protocol}//${location.host}`);
+
+                this.socket.onopen = () => {
+                    this.updateStatus('Connected', true);
+                };
+
+                this.socket.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    this.handleMessage(message);
+                };
+
+                this.socket.onclose = () => {
+                    this.updateStatus('Disconnected', false);
+                    setTimeout(() => this.connect(), 1000);
+                };
+
+                this.socket.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    this.updateStatus('Error', false);
+                };
+            }
+
+            setupEditor() {
+                let timeout;
+                
+                this.editor.addEventListener('input', (e) => {
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => {
+                        this.handleInput(e);
+                    }, 50);
+                });
+
+                this.editor.addEventListener('selectionchange', () => {
+                    this.sendCursorPosition();
+                });
+
+                this.editor.addEventListener('click', () => {
+                    this.sendCursorPosition();
+                });
+
+                this.editor.addEventListener('keyup', () => {
+                    this.sendCursorPosition();
+                });
+            }
+
+            handleInput(event) {
+                const currentContent = this.editor.value;
+                const operations = this.diffContent(this.lastContent, currentContent);
+                
+                operations.forEach(op => {
+                    this.sendOperation(op);
+                    this.logOperation(op);
+                });
+
+                this.lastContent = currentContent;
+            }
+
+            diffContent(oldContent, newContent) {
+                const operations = [];
+                let i = 0;
+                
+                while (i < Math.max(oldContent.length, newContent.length)) {
+                    if (i >= oldContent.length) {
+                        operations.push({
+                            type: 'insert',
+                            position: i,
+                            content: newContent.slice(i)
+                        });
+                        break;
+                    } else if (i >= newContent.length) {
+                        operations.push({
+                            type: 'delete',
+                            position: i,
+                            length: oldContent.length - i
+                        });
+                        break;
+                    } else if (oldContent[i] !== newContent[i]) {
+                        const commonEnd = this.findCommonSuffix(
+                            oldContent.slice(i), 
+                            newContent.slice(i)
+                        );
+                        
+                        const oldPart = oldContent.slice(i, oldContent.length - commonEnd);
+                        const newPart = newContent.slice(i, newContent.length - commonEnd);
+                        
+                        if (oldPart.length > 0) {
+                            operations.push({
+                                type: 'delete',
+                                position: i,
+                                length: oldPart.length
+                            });
+                        }
+                        
+                        if (newPart.length > 0) {
+                            operations.push({
+                                type: 'insert',
+                                position: i,
+                                content: newPart
+                            });
+                        }
+                        
+                        break;
+                    } else {
+                        i++;
+                    }
+                }
+                
+                return operations;
+            }
+
+            findCommonSuffix(str1, str2) {
+                let i = 0;
+                while (i < str1.length && i < str2.length && 
+                       str1[str1.length - 1 - i] === str2[str2.length - 1 - i]) {
+                    i++;
+                }
+                return i;
+            }
+
+            handleMessage(message) {
+                switch (message.type) {
+                    case 'init':
+                        this.clientId = message.clientId;
+                        this.editor.value = message.state.content;
+                        this.lastContent = message.state.content;
+                        break;
+
+                    case 'operation':
+                        this.applyOperation(message.operation);
+                        this.logOperation(message.operation, true);
+                        break;
+
+                    case 'cursor':
+                        this.updateCursor(message.clientId, message.position);
+                        break;
+
+                    case 'client-connect':
+                        this.addClient(message.clientId);
+                        break;
+
+                    case 'client-disconnect':
+                        this.removeClient(message.clientId);
+                        break;
+                }
+            }
+
+            applyOperation(operation) {
+                const start = this.editor.selectionStart;
+                const end = this.editor.selectionEnd;
+                
+                switch (operation.type) {
+                    case 'insert':
+                        this.editor.value = this.editor.value.slice(0, operation.position) + 
+                                          operation.content + 
+                                          this.editor.value.slice(operation.position);
+                        
+                        if (start >= operation.position) {
+                            this.editor.setSelectionRange(
+                                start + operation.content.length,
+                                end + operation.content.length
+                            );
+                        }
+                        break;
+
+                    case 'delete':
+                        this.editor.value = this.editor.value.slice(0, operation.position) + 
+                                          this.editor.value.slice(operation.position + operation.length);
+                        
+                        if (start >= operation.position + operation.length) {
+                            this.editor.setSelectionRange(
+                                start - operation.length,
+                                end - operation.length
+                            );
+                        } else if (start >= operation.position) {
+                            this.editor.setSelectionRange(operation.position, operation.position);
+                        }
+                        break;
+                }
+
+                this.lastContent = this.editor.value;
+            }
+
+            sendOperation(operation) {
+                if (this.socket?.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({
+                        type: 'operation',
+                        operation: {
+                            ...operation,
+                            clientId: this.clientId,
+                            timestamp: Date.now()
+                        }
+                    }));
+                }
+            }
+
+            sendCursorPosition() {
+                if (this.socket?.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({
+                        type: 'cursor',
+                        position: this.editor.selectionStart
+                    }));
+                }
+            }
+
+            updateCursor(clientId, position) {
+                if (clientId === this.clientId) return;
+
+                let cursor = document.getElementById(`cursor-${clientId}`);
+                if (!cursor) {
+                    cursor = document.createElement('div');
+                    cursor.id = `cursor-${clientId}`;
+                    cursor.className = `cursor client-${this.getClientColorIndex(clientId)}`;
+                    cursor.innerHTML = `<div class="cursor-label">User ${clientId.slice(-4)}</div>`;
+                    this.cursors.appendChild(cursor);
+                }
+
+                const coords = this.getTextPosition(position);
+                cursor.style.left = `${coords.x}px`;
+                cursor.style.top = `${coords.y}px`;
+            }
+
+            getTextPosition(position) {
+                const text = this.editor.value.slice(0, position);
+                const lines = text.split('\n');
+                const lineHeight = 22;
+                const charWidth = 8.4;
+                
+                return {
+                    x: lines[lines.length - 1].length * charWidth,
+                    y: (lines.length - 1) * lineHeight
+                };
+            }
+
+            getClientColorIndex(clientId) {
+                return Math.abs(clientId.split('').reduce((a, b) => a + b.charCodeAt(0), 0)) % 4 + 1;
+            }
+
+            addClient(clientId) {
+                this.clients.set(clientId, { id: clientId });
+                this.updateClientsList();
+            }
+
+            removeClient(clientId) {
+                this.clients.delete(clientId);
+                const cursor = document.getElementById(`cursor-${clientId}`);
+                if (cursor) cursor.remove();
+                this.updateClientsList();
+            }
+
+            updateClientsList() {
+                const container = document.getElementById('clients-container');
+                container.innerHTML = '';
+                
+                this.clients.forEach((client, clientId) => {
+                    const item = document.createElement('div');
+                    item.className = 'client-item';
+                    item.innerHTML = `
+                        <div class="client-color client-${this.getClientColorIndex(clientId)}" 
+                             style="background: var(--client-${this.getClientColorIndex(clientId)}-color)"></div>
+                        <div class="client-name">User ${clientId.slice(-4)}</div>
+                    `;
+                    container.appendChild(item);
+                });
+            }
+
+            logOperation(operation, remote = false) {
+                this.operationHistory.unshift({ ...operation, remote, timestamp: Date.now() });
+                if (this.operationHistory.length > 50) {
+                    this.operationHistory = this.operationHistory.slice(0, 50);
+                }
+                
+                this.updateOperationsLog();
+            }
+
+            updateOperationsLog() {
+                const container = document.getElementById('operations-container');
+                container.innerHTML = '';
+                
+                this.operationHistory.slice(0, 20).forEach(op => {
+                    const item = document.createElement('div');
+                    item.className = `operation-item operation-${op.type}`;
+                    
+                    const content = op.type === 'insert' ? 
+                        `"${op.content?.slice(0, 10)}${op.content?.length > 10 ? '...' : ''}"` :
+                        `${op.length} chars`;
+                    
+                    const source = op.remote ? 'remote' : 'local';
+                    const time = new Date(op.timestamp).toLocaleTimeString();
+                    
+                    item.innerHTML = `
+                        <span class="operation-type">${op.type}</span>
+                        ${content} at ${op.position}
+                        <div style="font-size: 10px; color: #666; margin-top: 2px;">
+                            ${source} • ${time}
+                        </div>
+                    `;
+                    container.appendChild(item);
+                });
+            }
+
+            updateStatus(status, connected) {
+                const statusEl = document.getElementById('connection-status');
+                const dotEl = document.querySelector('.status-dot');
+                
+                statusEl.textContent = status;
+                dotEl.style.background = connected ? '#4ade80' : '#ef4444';
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            new CollaborativeEditor();
+        });
+    </script>
+</body>
+</html>
